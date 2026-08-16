@@ -3,6 +3,9 @@
 // pipe (FIFO). PCM output to a PipeWire sink is not wired up yet (Phase 5).
 // Phase 3: phoneme FIFO added — each received line is now run through G2P
 // and the resulting IPA string is broadcast to whoever is reading the FIFO.
+// Phase 4: each utterance is now also synthesized to PCM and dumped to a
+// numbered debug WAV file, so synthesis correctness can be verified
+// (`aplay`) independently of the PipeWire wiring that comes in Phase 5.
 
 // POSIX headers (raw OS syscalls, not C++ standard library). Unix domain
 // sockets use the same API shape as TCP sockets (socket/bind/listen/accept)
@@ -42,6 +45,13 @@ constexpr const char* kPhonemeFifoPath = "/tmp/moonshine-tts-streamd.phonemes";
 // thread below, read by the main/accept-loop thread on every utterance —
 // std::atomic makes that cross-thread handoff race-free without a mutex.
 std::atomic<int> g_phoneme_fifo_fd{-1};
+
+// Counts utterances synthesized so far, used to number debug WAV files
+// (streamd-debug-0.wav, -1.wav, ...). Only ever touched from the single
+// accept-loop thread that runs synthesis, so a plain int is fine here —
+// no atomic needed (unlike g_phoneme_fifo_fd, which is written by the
+// background FIFO-opening thread).
+int g_debug_wav_counter = 0;
 
 /// Runs on a background thread, once, at startup. open()-ing a FIFO for
 /// writing BLOCKS until some process opens the other end for reading — if
@@ -259,6 +269,16 @@ int main() {
       const std::string ipa = g2p->text_to_ipa(line);
       std::cout << "  -> " << ipa << '\n';
       broadcast_phoneme_line(ipa);
+
+      // Phase 4: synthesize the phonemes to PCM and dump to a numbered debug
+      // WAV file. No PipeWire output yet (Phase 5) — this is purely so
+      // synthesis correctness can be verified in isolation.
+      const std::vector<float> pcm = tts->synthesize_from_phonemes(ipa);
+      const std::string wav_path =
+          "/tmp/moonshine-tts-streamd-debug-" + std::to_string(g_debug_wav_counter++) + ".wav";
+      moonshine_tts::write_wav_mono_pcm16(wav_path, pcm);
+      std::cout << "  -> wrote " << wav_path << " (" << pcm.size() << " samples, "
+                << MoonshineTTS::kSampleRateHz << " Hz)\n";
     });
     close(conn_fd);
   }
