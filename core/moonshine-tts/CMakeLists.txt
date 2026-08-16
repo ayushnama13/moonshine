@@ -193,6 +193,17 @@ if(MOONSHINE_TTS_BUILD_ONNX)
     copy_onnxruntime_dll(moonshine_tts)
   endif()
 
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(PIPEWIRE REQUIRED IMPORTED_TARGET libpipewire-0.3)
+
+  add_executable(moonshine_tts_streamd tools/moonshine-tts-streamd.cpp)
+  set_target_properties(moonshine_tts_streamd PROPERTIES OUTPUT_NAME "moonshine-tts-streamd")
+  target_link_libraries(moonshine_tts_streamd PRIVATE moonshine_tts_ort PkgConfig::PIPEWIRE)
+  moonshine_tts_set_ort_rpath(moonshine_tts_streamd)
+  if(WIN32)
+    copy_onnxruntime_dll(moonshine_tts_streamd)
+  endif()
+
   add_executable(moonshine_tts_g2p_cli tools/moonshine-g2p-cli.cpp)
   set_target_properties(moonshine_tts_g2p_cli PROPERTIES OUTPUT_NAME "moonshine-tts-g2p")
   target_link_libraries(moonshine_tts_g2p_cli PRIVATE moonshine_tts_ort)
