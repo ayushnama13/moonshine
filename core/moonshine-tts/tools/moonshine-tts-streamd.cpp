@@ -1,11 +1,23 @@
 // Streaming daemon: reads utterance lines from a Unix domain socket, drives
-// MoonshineTTS + MoonshineG2P (loaded once), and writes phonemes to a named
-// pipe (FIFO). PCM output to a PipeWire sink is not wired up yet (Phase 5).
+// MoonshineTTS + MoonshineG2P (loaded once), synthesizes PCM, and plays it
+// out through PipeWire in real time. Also writes phonemes to a named pipe
+// (FIFO) as a debug/observability side channel.
 // Phase 3: phoneme FIFO added — each received line is now run through G2P
 // and the resulting IPA string is broadcast to whoever is reading the FIFO.
-// Phase 4: each utterance is now also synthesized to PCM and dumped to a
-// numbered debug WAV file, so synthesis correctness can be verified
-// (`aplay`) independently of the PipeWire wiring that comes in Phase 5.
+// Phase 4: each utterance was also synthesized to PCM and dumped to a
+// numbered debug WAV file, to verify synthesis correctness in isolation
+// before wiring up real audio output.
+// Phase 5: real PipeWire output. The Phase 4 WAV dump is replaced with a
+// lock-free single-producer/single-consumer ring buffer, drained into the
+// audio device by PipeWire's own realtime thread (`on_process`).
+// Phase 6: the three-thread split is now explicit and enforced by which
+// function touches what — Thread A (accept loop, `main`) only reads lines
+// off the socket and pushes them onto a queue; Thread B (`run_synth_worker`)
+// owns `tts`/`g2p` exclusively, pops the queue, and does G2P + FIFO write +
+// synthesis + ring-buffer push, one utterance at a time; Thread C is
+// PipeWire's own thread running `on_process`, unchanged since Phase 5. This
+// means Thread A never blocks on synthesis — it can keep accepting/reading
+// while Thread B works through a backlog.
 
 // POSIX headers (raw OS syscalls, not C++ standard library). Unix domain
 // sockets use the same API shape as TCP sockets (socket/bind/listen/accept)
@@ -17,17 +29,28 @@
 #include <sys/un.h>      // sockaddr_un — the Unix-domain-socket address struct
 #include <unistd.h>      // read(), write(), close(), unlink()
 
-#include <atomic>      // std::atomic<int> — safe cross-thread fd handoff
-#include <cerrno>      // errno — set by syscalls on failure
-#include <csignal>     // signal(), SIGPIPE, SIG_IGN
-#include <cstdio>      // std::printf
-#include <cstring>     // std::strerror(), std::strncpy()
-#include <functional>  // std::function — type-erased callback wrapper
-#include <iostream>    // std::cout / std::cerr
-#include <optional>    // std::optional<T> — lets us delay construction
+#include <algorithm>            // std::min, std::fill — ring buffer + underrun silence-fill
+#include <atomic>               // std::atomic — safe cross-thread fd/index handoff
+#include <cerrno>               // errno — set by syscalls on failure
+#include <condition_variable>   // std::condition_variable — utterance queue wakeup
+#include <csignal>              // signal(), SIGPIPE, SIG_IGN
+#include <cstdio>               // std::printf
+#include <cstring>              // std::strerror(), std::strncpy()
+#include <functional>           // std::function — type-erased callback wrapper
+#include <iostream>             // std::cout / std::cerr
+#include <mutex>                // std::mutex, std::lock_guard, std::unique_lock
+#include <optional>             // std::optional<T> — lets us delay construction
+#include <queue>                // std::queue — Thread A -> Thread B utterance handoff
 #include <string>
-#include <thread>  // std::thread — background FIFO-opening thread
+#include <thread>  // std::thread — background FIFO-opening thread, synth worker
 #include <vector>
+
+// PipeWire + SPA (Simple Plugin API, PipeWire's underlying format/pod
+// negotiation library). spa/param/audio/format-utils.h pulls in the pod
+// builder and spa_audio_info_raw used to describe "mono F32 @ N Hz" to
+// PipeWire when connecting the stream.
+#include <pipewire/pipewire.h>
+#include <spa/param/audio/format-utils.h>
 
 #include "moonshine-g2p.h"  // MoonshineG2P: text -> IPA phonemes
 #include "moonshine-tts.h"  // MoonshineTTS: text/phonemes -> waveform
@@ -46,12 +69,118 @@ constexpr const char* kPhonemeFifoPath = "/tmp/moonshine-tts-streamd.phonemes";
 // std::atomic makes that cross-thread handoff race-free without a mutex.
 std::atomic<int> g_phoneme_fifo_fd{-1};
 
-// Counts utterances synthesized so far, used to number debug WAV files
-// (streamd-debug-0.wav, -1.wav, ...). Only ever touched from the single
-// accept-loop thread that runs synthesis, so a plain int is fine here —
-// no atomic needed (unlike g_phoneme_fifo_fd, which is written by the
-// background FIFO-opening thread).
-int g_debug_wav_counter = 0;
+/// Lock-free single-producer/single-consumer ring buffer of audio frames
+/// (mono float samples). Producer is the accept-loop/synth thread (`push`,
+/// called once per received utterance); consumer is PipeWire's own realtime
+/// thread (`pop`, called from `on_process` every time the audio device wants
+/// more frames). `write_`/`read_` are monotonically increasing frame counts
+/// (never wrapped) — the actual storage index is always `count % buf_.size()`
+/// — so "how much is available" is just subtraction, no explicit wrap-around
+/// bookkeeping needed. Safe without a mutex specifically *because* there is
+/// exactly one writer and one reader: each side only ever writes its own
+/// atomic and only ever reads the other's.
+class RingBuffer {
+ public:
+  explicit RingBuffer(size_t capacity_frames) : buf_(capacity_frames) {}
+
+  // Producer-only. Copies as much of [data, data+count) as currently fits;
+  // silently drops the tail if the consumer hasn't kept up. Dropping newly
+  // synthesized audio (rather than blocking synthesis until space frees up)
+  // is the right trade-off here: this daemon must never let a slow/stalled
+  // audio device stall the socket/text-in side.
+  void push(const float* data, size_t count) {
+    const size_t w = write_.load(std::memory_order_relaxed);
+    const size_t r = read_.load(std::memory_order_acquire);
+    const size_t free_frames = buf_.size() - (w - r);
+    const size_t n = std::min(count, free_frames);
+    for (size_t i = 0; i < n; ++i) {
+      buf_[(w + i) % buf_.size()] = data[i];
+    }
+    write_.store(w + n, std::memory_order_release);
+  }
+
+  // Consumer-only. Copies up to *count* frames into *dst*, returns how many
+  // were actually available (may be less than *count*, including 0). Caller
+  // is responsible for filling any shortfall — see on_process() below.
+  size_t pop(float* dst, size_t count) {
+    const size_t w = write_.load(std::memory_order_acquire);
+    const size_t r = read_.load(std::memory_order_relaxed);
+    const size_t avail = w - r;
+    const size_t n = std::min(count, avail);
+    for (size_t i = 0; i < n; ++i) {
+      dst[i] = buf_[(r + i) % buf_.size()];
+    }
+    read_.store(r + n, std::memory_order_release);
+    return n;
+  }
+
+ private:
+  std::vector<float> buf_;
+  std::atomic<size_t> write_{0};
+  std::atomic<size_t> read_{0};
+};
+
+// 10 seconds of buffered audio at the TTS engine's native sample rate —
+// generous headroom so a burst of several utterances queued back-to-back
+// doesn't overflow (which would silently drop audio) before PipeWire's
+// realtime thread drains it.
+RingBuffer g_ring_buffer(static_cast<size_t>(moonshine_tts::MoonshineTTS::kSampleRateHz) * 10);
+
+// The connected playback stream, set once in main() right after creation
+// and read by on_process() (which runs on PipeWire's own thread, not
+// main()'s) — never reassigned afterward, so no synchronization is needed
+// beyond it being set before pw_thread_loop_start() lets on_process() run
+// at all.
+pw_stream* g_pw_stream = nullptr;
+
+/// PipeWire calls this on its own realtime thread whenever the audio device
+/// wants more frames. Must stay allocation-free and non-blocking (per
+/// PW_STREAM_FLAG_RT_PROCESS) — it only ever touches the ring buffer and the
+/// buffer PipeWire hands it, never `tts`/`g2p`/sockets/FIFO.
+void on_process(void*) {
+  pw_buffer* b = pw_stream_dequeue_buffer(g_pw_stream);
+  if (!b) {
+    return;  // no buffer ready right now — nothing to do this callback
+  }
+  spa_buffer* buf = b->buffer;
+  float* dst = static_cast<float*>(buf->datas[0].data);
+  if (!dst) {
+    pw_stream_queue_buffer(g_pw_stream, b);
+    return;
+  }
+
+  constexpr uint32_t kStride = sizeof(float);  // mono F32: 1 sample = 1 frame
+  const uint32_t n_frames = buf->datas[0].maxsize / kStride;
+
+  const size_t got = g_ring_buffer.pop(dst, n_frames);
+  if (got < n_frames) {
+    // Underrun — ring buffer didn't have enough queued (e.g. no utterance
+    // synthesized recently). Silence, not garbage or a stall.
+    std::fill(dst + got, dst + n_frames, 0.0f);
+  }
+
+  buf->datas[0].chunk->offset = 0;
+  buf->datas[0].chunk->stride = static_cast<int32_t>(kStride);
+  buf->datas[0].chunk->size = n_frames * kStride;
+  pw_stream_queue_buffer(g_pw_stream, b);
+}
+
+// All fields explicit (rather than letting later ones default-initialize)
+// because this project builds with -Werror=missing-field-initializers.
+constexpr pw_stream_events kStreamEvents = {
+    .version = PW_VERSION_STREAM_EVENTS,
+    .destroy = nullptr,
+    .state_changed = nullptr,
+    .control_info = nullptr,
+    .io_changed = nullptr,
+    .param_changed = nullptr,
+    .add_buffer = nullptr,
+    .remove_buffer = nullptr,
+    .process = on_process,
+    .drained = nullptr,
+    .command = nullptr,
+    .trigger_done = nullptr,
+};
 
 /// Runs on a background thread, once, at startup. open()-ing a FIFO for
 /// writing BLOCKS until some process opens the other end for reading — if
@@ -96,6 +225,54 @@ void broadcast_phoneme_line(const std::string& ipa) {
     // (A more complete implementation would re-open and wait for a new
     // reader; out of scope for this phase per PLAN.md.)
     g_phoneme_fifo_fd.store(-1);
+  }
+}
+
+// Thread A (accept loop) -> Thread B (synth worker) handoff. A plain
+// mutex+condvar queue, not a lock-free structure like RingBuffer: utterance
+// lines arrive at human-typing/speaking rates, nowhere near the audio ring
+// buffer's per-callback frequency, so lock contention here is a non-issue —
+// using a mutex keeps this simple and correct instead of chasing
+// performance nothing here needs.
+std::mutex g_utterance_queue_mutex;
+std::condition_variable g_utterance_queue_cv;
+std::queue<std::string> g_utterance_queue;
+
+// Called from Thread A only (the accept-loop's read_lines callback). Thread
+// A's entire job is this: get the line off the socket and hand it off —
+// nothing here touches tts/g2p.
+void enqueue_utterance(std::string line) {
+  {
+    std::lock_guard<std::mutex> lock(g_utterance_queue_mutex);
+    g_utterance_queue.push(std::move(line));
+  }
+  g_utterance_queue_cv.notify_one();
+}
+
+/// Thread B. Runs for the lifetime of the process on its own detached
+/// thread, started once in main() after tts/g2p are loaded. Owns tts/g2p
+/// exclusively — Thread A never touches them, so no locking is needed
+/// around the G2P/synthesis calls themselves, only around the queue that
+/// feeds this loop.
+void run_synth_worker(moonshine_tts::MoonshineG2P& g2p, moonshine_tts::MoonshineTTS& tts) {
+  for (;;) {
+    std::string line;
+    {
+      std::unique_lock<std::mutex> lock(g_utterance_queue_mutex);
+      g_utterance_queue_cv.wait(lock, [] { return !g_utterance_queue.empty(); });
+      line = std::move(g_utterance_queue.front());
+      g_utterance_queue.pop();
+    }
+
+    std::cout << line << '\n';
+    const std::string ipa = g2p.text_to_ipa(line);
+    std::cout << "  -> " << ipa << '\n';
+    broadcast_phoneme_line(ipa);
+
+    const std::vector<float> pcm = tts.synthesize_from_phonemes(ipa);
+    g_ring_buffer.push(pcm.data(), pcm.size());
+    std::cout << "  -> queued " << pcm.size() << " samples ("
+              << moonshine_tts::MoonshineTTS::kSampleRateHz << " Hz) for playback\n";
   }
 }
 
@@ -180,6 +357,11 @@ int main() {
   }
   std::printf("streamd: model loaded (lang=%s)\n", lang.c_str());
 
+  // Phase 6, Thread B: the synth worker owns tts/g2p from here on. detach()
+  // for the same reason as the FIFO thread — it runs for the process
+  // lifetime, no join needed (no shutdown handler exists yet; Phase 7).
+  std::thread(run_synth_worker, std::ref(*g2p), std::ref(*tts)).detach();
+
   // Create the phoneme FIFO on disk (a special file — not a regular file —
   // that connects a writer and a reader like a pipe). mkfifo() fails with
   // EEXIST if a previous run already created it; that's fine, we just want
@@ -195,6 +377,60 @@ int main() {
   // starting up). detach() means we never join this thread — it runs for
   // the lifetime of the process and is torn down implicitly on exit.
   std::thread(open_phoneme_fifo_in_background).detach();
+
+  // --- Phase 5: PipeWire playback stream --------------------------------
+  // pw_init() must be called once before any other pipewire_*/pw_* call.
+  pw_init(nullptr, nullptr);
+
+  // A pw_thread_loop runs PipeWire's event loop (including on_process()) on
+  // its own dedicated thread, separate from this accept-loop/synth thread —
+  // required, since PipeWire's realtime callback must never share a thread
+  // with blocking work like accept()/read_lines().
+  pw_thread_loop* pw_loop = pw_thread_loop_new("moonshine-tts-streamd-pw", nullptr);
+  if (!pw_loop) {
+    std::cerr << "streamd: pw_thread_loop_new() failed\n";
+    return 1;
+  }
+
+  pw_properties* pw_props = pw_properties_new(PW_KEY_MEDIA_TYPE, "Audio", PW_KEY_MEDIA_CATEGORY,
+                                               "Playback", PW_KEY_MEDIA_ROLE, "Music", nullptr);
+  g_pw_stream = pw_stream_new_simple(pw_thread_loop_get_loop(pw_loop), "moonshine-tts-streamd",
+                                      pw_props, &kStreamEvents, nullptr);
+  if (!g_pw_stream) {
+    std::cerr << "streamd: pw_stream_new_simple() failed\n";
+    return 1;
+  }
+
+  // Describe the one format we offer: mono F32 at the TTS engine's native
+  // sample rate. Using MoonshineTTS::kSampleRateHz directly (never a
+  // hardcoded 24000) means a future model sample-rate change can't silently
+  // desync PipeWire's stream from what synthesize_from_phonemes() produces.
+  uint8_t pod_buffer[1024];
+  spa_pod_builder pod_builder = SPA_POD_BUILDER_INIT(pod_buffer, sizeof(pod_buffer));
+  spa_audio_info_raw audio_info{};
+  audio_info.format = SPA_AUDIO_FORMAT_F32;
+  audio_info.channels = 1;
+  audio_info.rate = static_cast<uint32_t>(MoonshineTTS::kSampleRateHz);
+  const spa_pod* pw_params[1];
+  pw_params[0] = spa_format_audio_raw_build(&pod_builder, SPA_PARAM_EnumFormat, &audio_info);
+
+  // AUTOCONNECT: attach to the system's default playback sink automatically.
+  // MAP_BUFFERS: mmap buffer memory so datas[0].data is directly usable, no
+  // extra copy step. RT_PROCESS: call on_process() from the realtime thread
+  // directly (lowest latency) — this is why on_process() must stay
+  // allocation-free and non-blocking.
+  const auto pw_flags = static_cast<pw_stream_flags>(
+      PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_RT_PROCESS);
+  if (pw_stream_connect(g_pw_stream, PW_DIRECTION_OUTPUT, PW_ID_ANY, pw_flags, pw_params, 1) < 0) {
+    std::cerr << "streamd: pw_stream_connect() failed\n";
+    return 1;
+  }
+
+  if (pw_thread_loop_start(pw_loop) < 0) {
+    std::cerr << "streamd: pw_thread_loop_start() failed\n";
+    return 1;
+  }
+  std::printf("streamd: PipeWire stream connecting (async; audio starts once negotiated)\n");
 
   // Unix sockets are backed by an actual file on disk at kSocketPath. If a
   // previous run crashed without cleaning up, that stale file is still
@@ -242,11 +478,12 @@ int main() {
   std::printf("streamd: phoneme FIFO at %s (waiting for a reader in the background)\n",
               kPhonemeFifoPath);
 
-  // Single-threaded, sequential: accept one client, fully drain it via
-  // read_lines() (blocks until that client disconnects), close it, then
-  // accept the next. Later phases split this into three threads (socket
-  // reader / synth worker / PipeWire callback) so synthesis work doesn't
-  // block new connections from being accepted — see PLAN.md Phase 6.
+  // Thread A. Accept one client at a time, fully drain it via read_lines()
+  // (blocks until that client disconnects), close it, accept the next.
+  // Still one connection at a time — Phase 6 doesn't change that — but this
+  // thread no longer blocks on G2P/synthesis while doing it: each line is
+  // just handed to Thread B via enqueue_utterance() and this loop moves
+  // straight on to reading the next one.
   for (;;) {
     // Blocks until a client connects. Returns a NEW fd (conn_fd) for this
     // specific connection; listen_fd stays open for future connections.
@@ -260,26 +497,7 @@ int main() {
       std::cerr << "streamd: accept() failed: " << std::strerror(errno) << '\n';
       break;
     }
-    // For each received line: run it through G2P to get an IPA phoneme
-    // string, echo the original text to stdout (so you can watch what
-    // arrived), and broadcast the phonemes to the FIFO. No audio synthesis
-    // yet — that's Phase 4 (debug WAV dump) and Phase 5 (real PipeWire).
-    read_lines(conn_fd, [&](const std::string& line) {
-      std::cout << line << '\n';
-      const std::string ipa = g2p->text_to_ipa(line);
-      std::cout << "  -> " << ipa << '\n';
-      broadcast_phoneme_line(ipa);
-
-      // Phase 4: synthesize the phonemes to PCM and dump to a numbered debug
-      // WAV file. No PipeWire output yet (Phase 5) — this is purely so
-      // synthesis correctness can be verified in isolation.
-      const std::vector<float> pcm = tts->synthesize_from_phonemes(ipa);
-      const std::string wav_path =
-          "/tmp/moonshine-tts-streamd-debug-" + std::to_string(g_debug_wav_counter++) + ".wav";
-      moonshine_tts::write_wav_mono_pcm16(wav_path, pcm);
-      std::cout << "  -> wrote " << wav_path << " (" << pcm.size() << " samples, "
-                << MoonshineTTS::kSampleRateHz << " Hz)\n";
-    });
+    read_lines(conn_fd, [](const std::string& line) { enqueue_utterance(line); });
     close(conn_fd);
   }
 
@@ -290,5 +508,16 @@ int main() {
   // belt-and-suspenders cleanup for the next run.
   close(listen_fd);
   unlink(kSocketPath);
+
+  // Lock while destroying the stream so it can't race with on_process()
+  // still running concurrently on pw_loop's own thread; stop the loop
+  // (joins its thread) before destroying it, then pw_deinit() last.
+  pw_thread_loop_lock(pw_loop);
+  pw_stream_destroy(g_pw_stream);
+  pw_thread_loop_unlock(pw_loop);
+  pw_thread_loop_stop(pw_loop);
+  pw_thread_loop_destroy(pw_loop);
+  pw_deinit();
+
   return 0;
 }
