@@ -1,3 +1,7 @@
+// Streaming TTS daemon: text in over a Unix socket, phonemes out over a
+// FIFO, PCM audio out over PipeWire. Three threads: socket accept loop,
+// synth worker (owns tts/g2p), PipeWire's own realtime callback.
+
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -32,13 +36,15 @@ namespace {
 constexpr const char* kSocketPath = "/tmp/moonshine-tts-streamd.sock";
 constexpr const char* kPhonemeFifoPath = "/tmp/moonshine-tts-streamd.phonemes";
 
-std::atomic<int> g_phoneme_fifo_fd{-1};
+std::atomic<int> g_phoneme_fifo_fd{-1};  // -1 = no reader attached yet
 
-volatile sig_atomic_t g_shutdown_requested = 0;
+volatile sig_atomic_t g_shutdown_requested = 0;  // set only from the signal handler
 int g_listen_fd = -1;
 
-std::atomic<bool> g_shutting_down{false};
+std::atomic<bool> g_shutting_down{false};  // worker-thread-visible shutdown flag
 
+// Signal-safe only: no malloc/printf/iostream. shutdown()s the listen socket
+// so a blocked accept() wakes up with EINTR instead of just sitting there.
 void handle_shutdown_signal(int) {
   g_shutdown_requested = 1;
   if (g_listen_fd >= 0) {
@@ -46,10 +52,13 @@ void handle_shutdown_signal(int) {
   }
 }
 
+// Lock-free SPSC ring buffer: synth worker pushes, PipeWire's on_process
+// pops. Safe without a mutex because there's exactly one writer/reader pair.
 class RingBuffer {
  public:
   explicit RingBuffer(size_t capacity_frames) : buf_(capacity_frames) {}
 
+  // Never blocks; returns frames actually accepted (may be < count).
   size_t push(const float* data, size_t count) {
     const size_t w = write_.load(std::memory_order_relaxed);
     const size_t r = read_.load(std::memory_order_acquire);
@@ -82,6 +91,10 @@ class RingBuffer {
 
 RingBuffer g_ring_buffer(static_cast<size_t>(moonshine_tts::MoonshineTTS::kSampleRateHz) * 10);
 
+// Retries until all of [data, data+count) lands in the ring buffer, so a
+// utterance longer than the buffer's capacity doesn't get its tail dropped.
+// Sleep-poll, not a condvar: signalling from on_process would need a lock,
+// which PW_STREAM_FLAG_RT_PROCESS forbids on that thread.
 size_t push_all_blocking(const float* data, size_t count) {
   size_t written = 0;
   while (written < count) {
@@ -99,6 +112,9 @@ size_t push_all_blocking(const float* data, size_t count) {
 
 pw_stream* g_pw_stream = nullptr;
 
+// Called on PipeWire's own realtime thread. Must stay allocation-free and
+// non-blocking — only ever touches the ring buffer and PipeWire's buffer,
+// never tts/g2p/sockets/FIFO.
 void on_process(void*) {
   pw_buffer* b = pw_stream_dequeue_buffer(g_pw_stream);
   if (!b) {
@@ -116,7 +132,7 @@ void on_process(void*) {
 
   const size_t got = g_ring_buffer.pop(dst, n_frames);
   if (got < n_frames) {
-
+    // Underrun (nothing queued recently) — pad with silence, not garbage.
     std::fill(dst + got, dst + n_frames, 0.0f);
   }
 
@@ -141,8 +157,9 @@ constexpr pw_stream_events kStreamEvents = {
     .trigger_done = nullptr,
 };
 
+// Runs on its own thread: opening a FIFO for write blocks until a reader
+// attaches, and we don't want that to hold up the socket side at startup.
 void open_phoneme_fifo_in_background() {
-
   int fd = open(kPhonemeFifoPath, O_WRONLY);
   if (fd < 0) {
     std::cerr << "streamd: failed to open phoneme FIFO for writing: "
@@ -159,6 +176,7 @@ void open_phoneme_fifo_in_background() {
   std::printf("streamd: phoneme FIFO reader attached\n");
 }
 
+// Best-effort: a missing/stalled reader must never block or fail synthesis.
 void broadcast_phoneme_line(const std::string& ipa) {
   int fd = g_phoneme_fifo_fd.load();
   if (fd < 0) {
@@ -178,6 +196,8 @@ void broadcast_phoneme_line(const std::string& ipa) {
   }
 }
 
+// Accept-loop (Thread A) -> synth worker (Thread B) handoff. Plain mutex,
+// not lock-free: utterance lines arrive at typing/speaking rates.
 std::mutex g_utterance_queue_mutex;
 std::condition_variable g_utterance_queue_cv;
 std::queue<std::string> g_utterance_queue;
@@ -190,6 +210,9 @@ void enqueue_utterance(std::string line) {
   g_utterance_queue_cv.notify_one();
 }
 
+// Thread B: owns tts/g2p exclusively, joined (not detached) by main() so
+// shutdown can't tear down the ONNX sessions out from under an in-flight
+// synthesize_from_phonemes() call.
 void run_synth_worker(moonshine_tts::MoonshineG2P& g2p, moonshine_tts::MoonshineTTS& tts) {
   for (;;) {
     std::string line;
@@ -223,8 +246,9 @@ void run_synth_worker(moonshine_tts::MoonshineG2P& g2p, moonshine_tts::Moonshine
   }
 }
 
+// Splits a socket stream into newline-delimited lines; a line may arrive
+// split across reads or several may land in one read(), so buf absorbs both.
 void read_lines(int conn_fd, const std::function<void(const std::string&)>& on_line) {
-
   std::string buf;
   char chunk[4096];
   for (;;) {
@@ -266,8 +290,9 @@ int main() {
 
   std::printf("streamd starting\n");
 
-  signal(SIGPIPE, SIG_IGN);
+  signal(SIGPIPE, SIG_IGN);  // FIFO write with no reader must not kill us
 
+  // Load once at startup — the whole point of a daemon vs. the batch CLI.
   MoonshineTTSOptions opt;
   const std::string lang = "en_us";
 
@@ -282,8 +307,12 @@ int main() {
   }
   std::printf("streamd: model loaded (lang=%s)\n", lang.c_str());
 
+  // Thread B. Kept joinable: it borrows tts/g2p, locals here, so it must be
+  // stopped and joined before this function returns and destroys them.
   std::thread synth_worker(run_synth_worker, std::ref(*g2p), std::ref(*tts));
 
+  // Idempotent — every return path below (early failures included) calls
+  // this so a still-joinable std::thread never gets destroyed while running.
   auto stop_synth_worker = [&synth_worker] {
     g_shutting_down.store(true);
     g_utterance_queue_cv.notify_all();
@@ -300,6 +329,7 @@ int main() {
 
   std::thread(open_phoneme_fifo_in_background).detach();
 
+  // --- PipeWire playback stream ---
   pw_init(nullptr, nullptr);
 
   pw_thread_loop* pw_loop = pw_thread_loop_new("moonshine-tts-streamd-pw", nullptr);
@@ -343,7 +373,8 @@ int main() {
   }
   std::printf("streamd: PipeWire stream connecting (async; audio starts once negotiated)\n");
 
-  unlink(kSocketPath);
+  // --- Unix domain socket, text in ---
+  unlink(kSocketPath);  // clear a stale file from a previous crashed run
 
   int listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
   if (listen_fd < 0) {
@@ -372,6 +403,8 @@ int main() {
     return 1;
   }
 
+  // SA_RESTART deliberately left unset: accept() must return EINTR, not
+  // silently retry, or the signal handler's shutdown() never unblocks it.
   struct sigaction shutdown_action {};
   shutdown_action.sa_handler = handle_shutdown_signal;
   sigemptyset(&shutdown_action.sa_mask);
@@ -383,8 +416,9 @@ int main() {
   std::printf("streamd: phoneme FIFO at %s (waiting for a reader in the background)\n",
               kPhonemeFifoPath);
 
+  // Thread A. One connection at a time; each line just gets handed off to
+  // Thread B, so this loop never blocks on G2P/synthesis.
   for (;;) {
-
     int conn_fd = accept(listen_fd, nullptr, nullptr);
     if (conn_fd < 0) {
       if (errno == EINTR) {
@@ -401,6 +435,9 @@ int main() {
     close(conn_fd);
   }
 
+  // Join Thread B first — guarantees it's done touching tts/g2p/ring buffer
+  // before we tear any of that down. Policy is drop-pending, not drain: it
+  // abandons the queued backlog and only finishes the utterance in flight.
   stop_synth_worker();
 
   close(listen_fd);
