@@ -151,6 +151,54 @@ the boundaries between utterances.
 **Verify:** `Ctrl-C` while audio is mid-playback exits cleanly (no hang, no crash, no leaked
 socket/FIFO file on disk for the next run to trip over).
 
+## Phase 7a — Correctness fixes from code review — DONE (builds clean)
+
+Post-Phase-7 review of `moonshine-tts-streamd.cpp` turned up four defects that a clean
+compile did not catch. All four are fixed; the target rebuilds clean. Still gated on TTS
+voice assets for runtime verification, same as every prior phase.
+
+1. **Use-after-free on shutdown — fixed.** Thread B was detached but held references to
+   `tts`/`g2p`, which are locals in `main()`. Returning from `main()` destroyed them
+   (tearing down the ONNX sessions) while the worker could still be inside
+   `synthesize_from_phonemes()` — i.e. Phase 7's own "no crash on Ctrl-C" check was not
+   actually satisfiable. Thread B is now joinable, exits on a new `g_shutting_down`
+   `std::atomic<bool>` (the condvar predicate wakes on it), and is joined before any
+   teardown. The DROP-not-drain policy is unchanged: the backlog is abandoned, so the join
+   is bounded by the one in-flight utterance. All eight early-failure `return 1;` paths
+   after the thread is spawned now go through the same `stop_synth_worker()` lambda —
+   destroying a joinable `std::thread` calls `std::terminate()`.
+2. **Silent truncation of long utterances — fixed.** `RingBuffer::push` dropped whatever did
+   not fit, so anything past the buffer's 10s capacity was lost with no diagnostic. Dropping
+   is correct for the realtime consumer but wrong for Thread B, which is not time-critical.
+   `push` now returns the frame count it accepted, and a new `push_all_blocking()` retries
+   the remainder on a 10ms sleep until it all lands. The wait is a sleep, not a condvar,
+   because signalling from `on_process` would require a lock there — forbidden under
+   `PW_STREAM_FLAG_RT_PROCESS`. The loop yields to `g_shutting_down` so a stalled sink
+   cannot wedge the join.
+3. **Ctrl-C ignored while a client was connected — fixed.** `read_lines()` treated every
+   `EINTR` as "retry", so the shutdown signal was swallowed and the accept loop never got to
+   see the flag until that client happened to disconnect. It now returns on `EINTR` when
+   `g_shutdown_requested` is set.
+4. **Phoneme FIFO could block synthesis — fixed.** The channel is documented as best-effort,
+   but a reader that attached and then stopped draining fills the 64K pipe and every later
+   `write()` blocked Thread B indefinitely. The fd is now flipped to `O_NONBLOCK` via
+   `fcntl` after the blocking open() handshake completes, and `EAGAIN`/`EWOULDBLOCK` is
+   treated as a dropped line (fd retained) rather than a dead channel.
+
+**Verify (still outstanding, asset-gated):** send an utterance longer than 10s and confirm it
+plays in full; `Ctrl-C` mid-playback with a client still connected exits promptly and without
+a crash; `cat` the phoneme FIFO, stop reading it, and confirm synthesis keeps running.
+
+### Reviewed but deliberately not fixed here
+
+Same review flagged these; they are design gaps rather than defects, and are left for a
+follow-up so this phase stays a bounded bug-fix: no barge-in/cancel command, whole-utterance
+(not per-sentence) time-to-first-audio, `state_changed` unwired so a failed PipeWire
+negotiation is silent, one-client-at-a-time accept loop, world-accessible `/tmp` socket+FIFO
+(should be `XDG_RUNTIME_DIR`, mode `0600`), `PW_KEY_MEDIA_ROLE` set to `Music` rather than
+`Speech`, unsynchronized `std::cout`/`std::printf` interleaving, and hardcoded
+`lang`/socket/FIFO paths with no argv flags.
+
 ## Out of scope (explicitly, per ARCH_DESIGN.md)
 
 - Sub-utterance incremental synthesis — no such primitive exists in the vocoder API, not

@@ -20,13 +20,36 @@
 // while Thread B works through a backlog.
 // Phase 7: SIGINT/SIGTERM now trigger orderly shutdown instead of an abrupt
 // kill. Policy (decided here, per PLAN.md's "decide and document which"):
-// DROP pending/in-flight work, don't drain it. Thread B is never joined
-// (still detached) and the utterance queue is not waited on — on shutdown we
-// stop accepting new connections, tear down PipeWire and the socket/FIFO
-// files, and exit. Draining would mean blocking process exit on however much
+// DROP pending work, don't drain it. The utterance queue is not waited on —
+// on shutdown we stop accepting new connections, tear down PipeWire and the
+// socket/FIFO files, and exit. (Phase 7 originally left Thread B detached
+// too; fix (1) below makes it joined, which does not change this policy —
+// see there.) Draining would mean blocking process exit on however much
 // synthesis work happens to be queued, which fights the whole point of a
 // signal handler (bounded, prompt shutdown); a caller that cares about
 // in-flight utterances should wait for a response before sending more.
+// Phase 7a: four correctness fixes on top of the above.
+//   (1) Thread B is now *joined*, not detached. It previously held
+//       references to `tts`/`g2p`, which are locals in main() — returning
+//       from main() destroyed them (tearing down the ONNX sessions) while
+//       Thread B could still be mid-synthesis, a use-after-free that would
+//       typically crash on Ctrl-C during playback. The DROP-don't-drain
+//       policy above is unchanged: the worker abandons whatever is still
+//       queued, it just finishes the one utterance already in flight so
+//       teardown can't race it.
+//   (2) RingBuffer::push now reports how many frames it actually took, and
+//       Thread B retries the remainder instead of silently discarding it.
+//       Dropping is the right policy for the realtime consumer, but Thread
+//       B is not time-critical, and the old behaviour truncated any
+//       utterance longer than the ring buffer (10s) with no diagnostic.
+//   (3) read_lines() now aborts on EINTR when shutdown was requested.
+//       It previously treated every EINTR as "retry", so a signal arriving
+//       while a client was connected was swallowed and shutdown was
+//       deferred until that client happened to disconnect.
+//   (4) The phoneme FIFO fd is switched to non-blocking after the reader
+//       attaches. write() to a full pipe (a reader that attached but stopped
+//       reading) would otherwise block Thread B indefinitely, which
+//       contradicts this channel's stated best-effort contract.
 
 // POSIX headers (raw OS syscalls, not C++ standard library). Unix domain
 // sockets use the same API shape as TCP sockets (socket/bind/listen/accept)
@@ -41,6 +64,7 @@
 #include <algorithm>            // std::min, std::fill — ring buffer + underrun silence-fill
 #include <atomic>               // std::atomic — safe cross-thread fd/index handoff
 #include <cerrno>               // errno — set by syscalls on failure
+#include <chrono>               // std::chrono — backoff while the ring buffer drains
 #include <condition_variable>   // std::condition_variable — utterance queue wakeup
 #include <csignal>              // signal(), SIGPIPE, SIG_IGN
 #include <cstdio>               // std::printf
@@ -86,6 +110,14 @@ std::atomic<int> g_phoneme_fifo_fd{-1};
 volatile sig_atomic_t g_shutdown_requested = 0;
 int g_listen_fd = -1;
 
+// Fix (1)/(2)/(3): the same "we are shutting down" fact, in a form the
+// worker threads can wait on. `g_shutdown_requested` above is written from
+// the signal handler and must stay `sig_atomic_t`; this one is written once
+// by main() *after* the accept loop exits, and is what Thread B polls (and
+// what the queue condvar's predicate tests) so the worker can wind down and
+// be joined rather than being torn down mid-flight by process exit.
+std::atomic<bool> g_shutting_down{false};
+
 // Signal handler: async-signal-safe only (no printf/malloc/iostream). Sets
 // the flag the accept loop polls, then shutdown()s the listening socket to
 // unblock a currently-blocked accept() call — shutdown() is POSIX
@@ -112,12 +144,13 @@ class RingBuffer {
  public:
   explicit RingBuffer(size_t capacity_frames) : buf_(capacity_frames) {}
 
-  // Producer-only. Copies as much of [data, data+count) as currently fits;
-  // silently drops the tail if the consumer hasn't kept up. Dropping newly
-  // synthesized audio (rather than blocking synthesis until space frees up)
-  // is the right trade-off here: this daemon must never let a slow/stalled
-  // audio device stall the socket/text-in side.
-  void push(const float* data, size_t count) {
+  // Producer-only. Copies as much of [data, data+count) as currently fits
+  // and returns how many frames were actually taken (may be less than
+  // *count*, including 0). This call itself never blocks — the audio device
+  // must never be able to stall the producer inside this function. Deciding
+  // what to do with an unaccepted tail is the caller's job; see
+  // push_all_blocking() below, which is what Thread B uses.
+  size_t push(const float* data, size_t count) {
     const size_t w = write_.load(std::memory_order_relaxed);
     const size_t r = read_.load(std::memory_order_acquire);
     const size_t free_frames = buf_.size() - (w - r);
@@ -126,6 +159,7 @@ class RingBuffer {
       buf_[(w + i) % buf_.size()] = data[i];
     }
     write_.store(w + n, std::memory_order_release);
+    return n;
   }
 
   // Consumer-only. Copies up to *count* frames into *dst*, returns how many
@@ -154,6 +188,37 @@ class RingBuffer {
 // doesn't overflow (which would silently drop audio) before PipeWire's
 // realtime thread drains it.
 RingBuffer g_ring_buffer(static_cast<size_t>(moonshine_tts::MoonshineTTS::kSampleRateHz) * 10);
+
+// Fix (2). Pushes *all* of [data, data+count) into the ring buffer, waiting
+// for the realtime consumer to make room whenever it fills up. Called only
+// from Thread B, which is explicitly *not* time-critical — so unlike the
+// realtime thread, it can afford to wait rather than discard. Without this,
+// any utterance longer than the ring buffer's 10s capacity had its tail
+// silently truncated.
+//
+// The wait is a plain sleep rather than a condvar because the other side is
+// PipeWire's realtime callback: signalling a condvar from `on_process` would
+// mean taking a lock there, which is exactly what PW_STREAM_FLAG_RT_PROCESS
+// forbids. 10ms is far below the buffer's 10s capacity, so the polling costs
+// nothing and only ever runs at all for unusually long utterances.
+//
+// Returns the number of frames actually written, which is < *count* only if
+// shutdown was requested partway through — the wait loop always yields to
+// shutdown so a stopped/stalled audio device can't wedge the join in main().
+size_t push_all_blocking(const float* data, size_t count) {
+  size_t written = 0;
+  while (written < count) {
+    written += g_ring_buffer.push(data + written, count - written);
+    if (written == count) {
+      break;
+    }
+    if (g_shutting_down.load()) {
+      break;  // abandon the rest; we're dropping pending work anyway
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return written;
+}
 
 // The connected playback stream, set once in main() right after creation
 // and read by on_process() (which runs on PipeWire's own thread, not
@@ -227,6 +292,18 @@ void open_phoneme_fifo_in_background() {
               << std::strerror(errno) << '\n';
     return;
   }
+  // Fix (4). The open() above is deliberately blocking — that's the whole
+  // handshake, and the whole reason this runs on its own thread. Subsequent
+  // *writes* must not be: a reader that attaches and then stops draining
+  // fills the pipe (64K by default on Linux) and every later write() would
+  // block Thread B — i.e. stall synthesis — on what is supposed to be a
+  // best-effort debug channel. Flip the fd to non-blocking now that the
+  // handshake is done, so a full pipe surfaces as EAGAIN and gets dropped.
+  int flags = fcntl(fd, F_GETFL, 0);
+  if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+    std::cerr << "streamd: failed to set phoneme FIFO non-blocking: " << std::strerror(errno)
+              << " (continuing; writes may block if the reader stalls)\n";
+  }
   g_phoneme_fifo_fd.store(fd);
   std::printf("streamd: phoneme FIFO reader attached\n");
 }
@@ -249,6 +326,13 @@ void broadcast_phoneme_line(const std::string& ipa) {
   // signal.
   ssize_t n = write(fd, line.data(), line.size());
   if (n < 0) {
+    // EAGAIN/EWOULDBLOCK: the fd is non-blocking (see
+    // open_phoneme_fifo_in_background) and the pipe is full because the
+    // reader isn't keeping up. That's a dropped phoneme line, not a broken
+    // channel — keep the fd and try again on the next utterance.
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      return;
+    }
     std::cerr << "streamd: phoneme FIFO write failed: " << std::strerror(errno) << '\n';
     // Reader vanished; stop broadcasting until (if) this daemon restarts.
     // (A more complete implementation would re-open and wait for a new
@@ -278,17 +362,31 @@ void enqueue_utterance(std::string line) {
   g_utterance_queue_cv.notify_one();
 }
 
-/// Thread B. Runs for the lifetime of the process on its own detached
-/// thread, started once in main() after tts/g2p are loaded. Owns tts/g2p
-/// exclusively — Thread A never touches them, so no locking is needed
-/// around the G2P/synthesis calls themselves, only around the queue that
-/// feeds this loop.
+/// Thread B. Started once in main() after tts/g2p are loaded, and — as of
+/// fix (1) — *joined* by main() during shutdown rather than detached. Owns
+/// tts/g2p exclusively: Thread A never touches them, so no locking is
+/// needed around the G2P/synthesis calls themselves, only around the queue
+/// that feeds this loop.
+///
+/// The join matters because `tts`/`g2p` are locals in main(): if this thread
+/// were still running when main() returned, their destructors would tear
+/// down the ONNX sessions out from under an in-flight
+/// `synthesize_from_phonemes()` call. Joining also keeps the DROP-not-drain
+/// policy intact — the loop below exits as soon as it sees the shutdown
+/// flag, abandoning anything still queued, so the join is bounded by the
+/// single utterance already being synthesized, not by the backlog.
 void run_synth_worker(moonshine_tts::MoonshineG2P& g2p, moonshine_tts::MoonshineTTS& tts) {
   for (;;) {
     std::string line;
     {
       std::unique_lock<std::mutex> lock(g_utterance_queue_mutex);
-      g_utterance_queue_cv.wait(lock, [] { return !g_utterance_queue.empty(); });
+      // Wake on either a new utterance or shutdown, so an idle worker
+      // parked here doesn't keep main() blocked in join() forever.
+      g_utterance_queue_cv.wait(
+          lock, [] { return !g_utterance_queue.empty() || g_shutting_down.load(); });
+      if (g_shutting_down.load()) {
+        return;  // drop whatever is still queued (see policy note in header)
+      }
       line = std::move(g_utterance_queue.front());
       g_utterance_queue.pop();
     }
@@ -299,9 +397,17 @@ void run_synth_worker(moonshine_tts::MoonshineG2P& g2p, moonshine_tts::Moonshine
     broadcast_phoneme_line(ipa);
 
     const std::vector<float> pcm = tts.synthesize_from_phonemes(ipa);
-    g_ring_buffer.push(pcm.data(), pcm.size());
-    std::cout << "  -> queued " << pcm.size() << " samples ("
+    // Fix (2): push the whole thing, waiting out the realtime consumer if
+    // this utterance is longer than the ring buffer, instead of letting the
+    // tail be discarded without a word.
+    const size_t queued = push_all_blocking(pcm.data(), pcm.size());
+    std::cout << "  -> queued " << queued << " samples ("
               << moonshine_tts::MoonshineTTS::kSampleRateHz << " Hz) for playback\n";
+    if (queued < pcm.size()) {
+      // Only reachable on shutdown — push_all_blocking otherwise waits.
+      std::cerr << "streamd: dropped " << (pcm.size() - queued)
+                << " samples of audio (shutting down)\n";
+    }
   }
 }
 
@@ -323,8 +429,16 @@ void read_lines(int conn_fd, const std::function<void(const std::string&)>& on_l
     ssize_t n = read(conn_fd, chunk, sizeof(chunk));
     if (n < 0) {
       // EINTR = the call was interrupted by a signal, not a real error —
-      // just retry. Anything else is a genuine failure.
+      // normally just retry. Anything else is a genuine failure.
       if (errno == EINTR) {
+        // Fix (3). If that signal was our shutdown signal, retrying would
+        // park us back in a blocking read() and the accept loop would never
+        // get to see the shutdown flag — Ctrl-C would appear to hang for as
+        // long as this client stayed connected. Bail out instead; the
+        // caller closes the fd and the accept loop then notices the flag.
+        if (g_shutdown_requested) {
+          return;
+        }
         continue;
       }
       std::cerr << "streamd: read error: " << std::strerror(errno) << '\n';
@@ -386,10 +500,24 @@ int main() {
   }
   std::printf("streamd: model loaded (lang=%s)\n", lang.c_str());
 
-  // Phase 6, Thread B: the synth worker owns tts/g2p from here on. detach()
-  // for the same reason as the FIFO thread — it runs for the process
-  // lifetime, no join needed (no shutdown handler exists yet; Phase 7).
-  std::thread(run_synth_worker, std::ref(*g2p), std::ref(*tts)).detach();
+  // Phase 6, Thread B: the synth worker owns tts/g2p from here on. Unlike
+  // the FIFO thread this one is kept joinable — fix (1): it borrows `tts`
+  // and `g2p`, which are locals in this function, so it must be shut down
+  // and joined before this function returns and destroys them.
+  std::thread synth_worker(run_synth_worker, std::ref(*g2p), std::ref(*tts));
+
+  // Signals Thread B to stop and waits for it. Idempotent, so the normal
+  // shutdown path and the early-failure paths below can both just call it.
+  // Every `return` after this point must go through it: destroying a
+  // still-joinable std::thread calls std::terminate(), and returning while
+  // it still runs is the very use-after-free fix (1) is about.
+  auto stop_synth_worker = [&synth_worker] {
+    g_shutting_down.store(true);
+    g_utterance_queue_cv.notify_all();
+    if (synth_worker.joinable()) {
+      synth_worker.join();
+    }
+  };
 
   // Create the phoneme FIFO on disk (a special file — not a regular file —
   // that connects a writer and a reader like a pipe). mkfifo() fails with
@@ -398,6 +526,7 @@ int main() {
   // the return value strictly.
   if (mkfifo(kPhonemeFifoPath, 0666) < 0 && errno != EEXIST) {
     std::cerr << "streamd: mkfifo() failed: " << std::strerror(errno) << '\n';
+    stop_synth_worker();
     return 1;
   }
   // Hand this off to a background thread (see open_phoneme_fifo_in_background
@@ -418,6 +547,7 @@ int main() {
   pw_thread_loop* pw_loop = pw_thread_loop_new("moonshine-tts-streamd-pw", nullptr);
   if (!pw_loop) {
     std::cerr << "streamd: pw_thread_loop_new() failed\n";
+    stop_synth_worker();
     return 1;
   }
 
@@ -427,6 +557,7 @@ int main() {
                                       pw_props, &kStreamEvents, nullptr);
   if (!g_pw_stream) {
     std::cerr << "streamd: pw_stream_new_simple() failed\n";
+    stop_synth_worker();
     return 1;
   }
 
@@ -452,11 +583,13 @@ int main() {
       PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_RT_PROCESS);
   if (pw_stream_connect(g_pw_stream, PW_DIRECTION_OUTPUT, PW_ID_ANY, pw_flags, pw_params, 1) < 0) {
     std::cerr << "streamd: pw_stream_connect() failed\n";
+    stop_synth_worker();
     return 1;
   }
 
   if (pw_thread_loop_start(pw_loop) < 0) {
     std::cerr << "streamd: pw_thread_loop_start() failed\n";
+    stop_synth_worker();
     return 1;
   }
   std::printf("streamd: PipeWire stream connecting (async; audio starts once negotiated)\n");
@@ -473,6 +606,7 @@ int main() {
   int listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
   if (listen_fd < 0) {
     std::cerr << "streamd: socket() failed: " << std::strerror(errno) << '\n';
+    stop_synth_worker();
     return 1;
   }
   g_listen_fd = listen_fd;
@@ -492,6 +626,7 @@ int main() {
   if (bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
     std::cerr << "streamd: bind() failed: " << std::strerror(errno) << '\n';
     close(listen_fd);
+    stop_synth_worker();
     return 1;
   }
 
@@ -501,6 +636,7 @@ int main() {
   if (listen(listen_fd, /*backlog=*/4) < 0) {
     std::cerr << "streamd: listen() failed: " << std::strerror(errno) << '\n';
     close(listen_fd);
+    stop_synth_worker();
     return 1;
   }
 
@@ -548,11 +684,22 @@ int main() {
     close(conn_fd);
   }
 
-  // Reached either on shutdown signal or a non-EINTR accept() error. Thread
-  // B (synth worker) and the FIFO-opener thread stay detached and are not
-  // joined — see the Phase 7 header comment on why pending work is dropped,
-  // not drained. Process exit below tears them down along with everything
-  // else.
+  // Reached either on shutdown signal or a non-EINTR accept() error.
+  //
+  // Fix (1): stop and join Thread B *first*, before anything else is torn
+  // down. It abandons the queued backlog immediately (pending work is
+  // dropped, per the Phase 7 policy) and only has to finish the single
+  // utterance it may already be synthesizing, so this is bounded. Joining
+  // here is what guarantees it is no longer touching `tts`/`g2p` (destroyed
+  // when this function returns) or the ring buffer (about to lose its
+  // PipeWire consumer).
+  //
+  // The FIFO-opener thread is still detached and deliberately not joined:
+  // if no reader ever attached it is parked forever inside a blocking
+  // open(), so joining it could hang shutdown indefinitely. It touches
+  // nothing but the atomic fd, so leaving it to process exit is safe.
+  stop_synth_worker();
+
   close(listen_fd);
   unlink(kSocketPath);
   unlink(kPhonemeFifoPath);
