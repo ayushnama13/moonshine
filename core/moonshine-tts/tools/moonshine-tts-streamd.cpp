@@ -18,6 +18,15 @@
 // PipeWire's own thread running `on_process`, unchanged since Phase 5. This
 // means Thread A never blocks on synthesis — it can keep accepting/reading
 // while Thread B works through a backlog.
+// Phase 7: SIGINT/SIGTERM now trigger orderly shutdown instead of an abrupt
+// kill. Policy (decided here, per PLAN.md's "decide and document which"):
+// DROP pending/in-flight work, don't drain it. Thread B is never joined
+// (still detached) and the utterance queue is not waited on — on shutdown we
+// stop accepting new connections, tear down PipeWire and the socket/FIFO
+// files, and exit. Draining would mean blocking process exit on however much
+// synthesis work happens to be queued, which fights the whole point of a
+// signal handler (bounded, prompt shutdown); a caller that cares about
+// in-flight utterances should wait for a response before sending more.
 
 // POSIX headers (raw OS syscalls, not C++ standard library). Unix domain
 // sockets use the same API shape as TCP sockets (socket/bind/listen/accept)
@@ -68,6 +77,26 @@ constexpr const char* kPhonemeFifoPath = "/tmp/moonshine-tts-streamd.phonemes";
 // thread below, read by the main/accept-loop thread on every utterance —
 // std::atomic makes that cross-thread handoff race-free without a mutex.
 std::atomic<int> g_phoneme_fifo_fd{-1};
+
+// Phase 7 shutdown. `sig_atomic_t` (not `std::atomic<bool>`) is the type
+// POSIX actually guarantees is safe to write from inside a signal handler.
+// `g_listen_fd` is set once in main() before the signal handler is
+// installed, then read (never written) by the handler — safe without
+// synchronization since the handler only runs after that one-time set.
+volatile sig_atomic_t g_shutdown_requested = 0;
+int g_listen_fd = -1;
+
+// Signal handler: async-signal-safe only (no printf/malloc/iostream). Sets
+// the flag the accept loop polls, then shutdown()s the listening socket to
+// unblock a currently-blocked accept() call — shutdown() is POSIX
+// async-signal-safe. Installed with SA_RESTART *not* set (see main()), so
+// accept() returns EINTR here rather than transparently retrying.
+void handle_shutdown_signal(int) {
+  g_shutdown_requested = 1;
+  if (g_listen_fd >= 0) {
+    shutdown(g_listen_fd, SHUT_RDWR);
+  }
+}
 
 /// Lock-free single-producer/single-consumer ring buffer of audio frames
 /// (mono float samples). Producer is the accept-loop/synth thread (`push`,
@@ -446,6 +475,7 @@ int main() {
     std::cerr << "streamd: socket() failed: " << std::strerror(errno) << '\n';
     return 1;
   }
+  g_listen_fd = listen_fd;
 
   // sockaddr_un is the address struct for Unix sockets: a sun_path fixed-size
   // char array (holding a filesystem path) instead of an IP+port.
@@ -474,6 +504,19 @@ int main() {
     return 1;
   }
 
+  // Phase 7: install SIGINT/SIGTERM handlers now, right before the accept
+  // loop starts (everything before this point either can't be interrupted
+  // mid-syscall in a way that matters, or hasn't created state that needs
+  // tearing down yet). sigaction (not signal()) so we can explicitly leave
+  // SA_RESTART unset — accept() must return EINTR, not silently retry,
+  // otherwise the handler's shutdown() would never actually unblock it.
+  struct sigaction shutdown_action {};
+  shutdown_action.sa_handler = handle_shutdown_signal;
+  sigemptyset(&shutdown_action.sa_mask);
+  shutdown_action.sa_flags = 0;
+  sigaction(SIGINT, &shutdown_action, nullptr);
+  sigaction(SIGTERM, &shutdown_action, nullptr);
+
   std::printf("streamd: listening on %s\n", kSocketPath);
   std::printf("streamd: phoneme FIFO at %s (waiting for a reader in the background)\n",
               kPhonemeFifoPath);
@@ -492,7 +535,11 @@ int main() {
     int conn_fd = accept(listen_fd, nullptr, nullptr);
     if (conn_fd < 0) {
       if (errno == EINTR) {
-        continue;
+        if (g_shutdown_requested) {
+          std::printf("streamd: shutdown signal received, stopping\n");
+          break;
+        }
+        continue;  // interrupted by some other/spurious signal — keep going
       }
       std::cerr << "streamd: accept() failed: " << std::strerror(errno) << '\n';
       break;
@@ -501,13 +548,14 @@ int main() {
     close(conn_fd);
   }
 
-  // Only reached if the accept loop above breaks (a non-EINTR accept()
-  // error). Note: there's no SIGINT/SIGTERM handler yet (that's Phase 7),
-  // so Ctrl-C kills the process abruptly and this cleanup never runs in
-  // that case — which is exactly why unlink() at startup exists too, as a
-  // belt-and-suspenders cleanup for the next run.
+  // Reached either on shutdown signal or a non-EINTR accept() error. Thread
+  // B (synth worker) and the FIFO-opener thread stay detached and are not
+  // joined — see the Phase 7 header comment on why pending work is dropped,
+  // not drained. Process exit below tears them down along with everything
+  // else.
   close(listen_fd);
   unlink(kSocketPath);
+  unlink(kPhonemeFifoPath);
 
   // Lock while destroying the stream so it can't race with on_process()
   // still running concurrently on pw_loop's own thread; stop the loop
