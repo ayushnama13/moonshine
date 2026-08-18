@@ -42,6 +42,46 @@ python3 scripts/tts-streamd-test-client.py --delay 1.0 "hello there" "second lin
 
 Sends lines over the socket and tails the phoneme FIFO concurrently.
 
+### Direct commands (no test client)
+
+Send text straight over the socket with `nc -U` (one line = one utterance;
+each utterance is split into sentences internally, so audio for the first
+sentence starts before the rest finishes synthesizing):
+
+```bash
+printf "Hello there.\n" | nc -U /tmp/moonshine-tts-streamd.sock
+printf "First sentence. Second sentence. Third one.\n" | nc -U /tmp/moonshine-tts-streamd.sock
+```
+
+Watch the phoneme output live in another terminal (blocks until the daemon
+attaches a writer, so start this before or right after sending text):
+
+```bash
+cat /tmp/moonshine-tts-streamd.phonemes
+```
+
+Cancel what's queued/playing by sending a control line instead of text —
+`!stop` and `!flush` are equivalent, both clear the utterance queue and any
+audio already sitting in the playback ring buffer:
+
+```bash
+printf "!stop\n" | nc -U /tmp/moonshine-tts-streamd.sock
+```
+
+A held-open connection can send multiple lines back to back (each still
+one utterance):
+
+```bash
+nc -U /tmp/moonshine-tts-streamd.sock <<'EOF'
+This plays first.
+!stop
+This plays instead, since the line above never has time to finish.
+EOF
+```
+
+Note: the very first utterance after startup is slow (kokoro cold-starts
+on CPU, tens of seconds); subsequent ones are much faster.
+
 ## Shutdown
 
 `Ctrl-C` / `SIGTERM` triggers an orderly shutdown: stops accepting new
