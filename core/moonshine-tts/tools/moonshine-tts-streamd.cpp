@@ -439,6 +439,14 @@ int main() {
   using moonshine_tts::MoonshineTTS;
   using moonshine_tts::MoonshineTTSOptions;
 
+  // Line-buffer stdout. A daemon's stdout is usually a pipe or a log file,
+  // not a tty, and the C runtime then picks *full* buffering — so progress
+  // lines sit in the buffer for minutes and only appear when the process
+  // exits, which makes a busy daemon look hung. Must happen before the first
+  // write to the stream. std::cout is synced with stdout by default, so this
+  // covers the worker thread's logging too.
+  setvbuf(stdout, nullptr, _IOLBF, 0);
+
   std::printf("streamd starting\n");
 
   signal(SIGPIPE, SIG_IGN);  // FIFO write with no reader must not kill us
@@ -457,6 +465,32 @@ int main() {
     return 1;
   }
   std::printf("streamd: model loaded (lang=%s)\n", lang.c_str());
+
+  // Pre-warm. Constructing the model is not the whole cost: ORT defers a lot
+  // of work (graph optimization, kernel/arena setup) to the first inference,
+  // which made the first real utterance take minutes on CPU while every
+  // later one took seconds. Burn that cost here, on a throwaway phrase,
+  // *before* the socket is listening — a daemon that takes longer to start
+  // but answers its first request promptly is the right trade. The audio is
+  // discarded (nothing is pushed to the ring buffer) and the PipeWire stream
+  // doesn't exist yet, so nothing is audible.
+  //
+  // Best-effort: a warm-up failure is not fatal. If it throws, the same call
+  // would throw for a real utterance too, but that's the synth worker's
+  // problem to report per-utterance — it must not stop the daemon booting.
+  std::printf("streamd: warming up (first inference is slow; this is a one-time cost)\n");
+  try {
+    const auto warmup_start = std::chrono::steady_clock::now();
+    const std::string warmup_ipa = g2p->text_to_ipa("warm up");
+    const std::vector<float> warmup_pcm = tts->synthesize_from_phonemes(warmup_ipa);
+    const auto warmup_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - warmup_start)
+                               .count();
+    std::printf("streamd: warm-up done in %lld ms (%zu samples discarded)\n",
+                static_cast<long long>(warmup_ms), warmup_pcm.size());
+  } catch (const std::exception& e) {
+    std::cerr << "streamd: warm-up failed (continuing anyway): " << e.what() << '\n';
+  }
 
   // Thread B. Kept joinable: it borrows tts/g2p, locals here, so it must be
   // stopped and joined before this function returns and destroys them.
