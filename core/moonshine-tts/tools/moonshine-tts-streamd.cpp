@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -42,6 +43,7 @@ volatile sig_atomic_t g_shutdown_requested = 0;  // set only from the signal han
 int g_listen_fd = -1;
 
 std::atomic<bool> g_shutting_down{false};  // worker-thread-visible shutdown flag
+std::atomic<uint64_t> g_generation{0};   // barge-in / cancellation generation counter
 
 // Signal-safe only: no malloc/printf/iostream. shutdown()s the listen socket
 // so a blocked accept() wakes up with EINTR instead of just sitting there.
@@ -58,8 +60,16 @@ class RingBuffer {
  public:
   explicit RingBuffer(size_t capacity_frames) : buf_(capacity_frames) {}
 
+  void clear() {
+    clear_requested_.store(true, std::memory_order_release);
+  }
+
   // Never blocks; returns frames actually accepted (may be < count).
   size_t push(const float* data, size_t count) {
+    if (clear_requested_.exchange(false, std::memory_order_acq_rel)) {
+      const size_t w = write_.load(std::memory_order_acquire);
+      read_.store(w, std::memory_order_release);
+    }
     const size_t w = write_.load(std::memory_order_relaxed);
     const size_t r = read_.load(std::memory_order_acquire);
     const size_t free_frames = buf_.size() - (w - r);
@@ -72,6 +82,12 @@ class RingBuffer {
   }
 
   size_t pop(float* dst, size_t count) {
+    if (clear_requested_.exchange(false, std::memory_order_acq_rel)) {
+      const size_t w = write_.load(std::memory_order_acquire);
+      read_.store(w, std::memory_order_release);
+      std::fill(dst, dst + count, 0.0f);
+      return 0;
+    }
     const size_t w = write_.load(std::memory_order_acquire);
     const size_t r = read_.load(std::memory_order_relaxed);
     const size_t avail = w - r;
@@ -87,6 +103,7 @@ class RingBuffer {
   std::vector<float> buf_;
   std::atomic<size_t> write_{0};
   std::atomic<size_t> read_{0};
+  std::atomic<bool> clear_requested_{false};
 };
 
 RingBuffer g_ring_buffer(static_cast<size_t>(moonshine_tts::MoonshineTTS::kSampleRateHz) * 10);
@@ -95,14 +112,17 @@ RingBuffer g_ring_buffer(static_cast<size_t>(moonshine_tts::MoonshineTTS::kSampl
 // utterance longer than the buffer's capacity doesn't get its tail dropped.
 // Sleep-poll, not a condvar: signalling from on_process would need a lock,
 // which PW_STREAM_FLAG_RT_PROCESS forbids on that thread.
-size_t push_all_blocking(const float* data, size_t count) {
+size_t push_all_blocking(const float* data, size_t count, uint64_t target_gen) {
   size_t written = 0;
   while (written < count) {
+    if (g_generation.load(std::memory_order_relaxed) != target_gen) {
+      break;
+    }
     written += g_ring_buffer.push(data + written, count - written);
     if (written == count) {
       break;
     }
-    if (g_shutting_down.load()) {
+    if (g_shutting_down.load(std::memory_order_relaxed)) {
       break;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -111,6 +131,19 @@ size_t push_all_blocking(const float* data, size_t count) {
 }
 
 pw_stream* g_pw_stream = nullptr;
+
+// Called on PipeWire's state changes to ensure errors/negotiation failures are logged.
+void on_state_changed(void*, enum pw_stream_state old_state, enum pw_stream_state state, const char* error) {
+  std::printf("streamd: PipeWire stream state: %s -> %s%s%s%s\n",
+              pw_stream_state_as_string(old_state),
+              pw_stream_state_as_string(state),
+              error ? " (error: " : "",
+              error ? error : "",
+              error ? ")" : "");
+  if (state == PW_STREAM_STATE_ERROR) {
+    std::cerr << "streamd: PipeWire stream error: " << (error ? error : "unknown error") << '\n';
+  }
+}
 
 // Called on PipeWire's own realtime thread. Must stay allocation-free and
 // non-blocking — only ever touches the ring buffer and PipeWire's buffer,
@@ -145,7 +178,7 @@ void on_process(void*) {
 constexpr pw_stream_events kStreamEvents = {
     .version = PW_VERSION_STREAM_EVENTS,
     .destroy = nullptr,
-    .state_changed = nullptr,
+    .state_changed = on_state_changed,
     .control_info = nullptr,
     .io_changed = nullptr,
     .param_changed = nullptr,
@@ -202,12 +235,98 @@ std::mutex g_utterance_queue_mutex;
 std::condition_variable g_utterance_queue_cv;
 std::queue<std::string> g_utterance_queue;
 
+void handle_flush_command() {
+  {
+    std::lock_guard<std::mutex> lock(g_utterance_queue_mutex);
+    std::queue<std::string> empty;
+    std::swap(g_utterance_queue, empty);
+  }
+  const uint64_t new_gen = g_generation.fetch_add(1, std::memory_order_relaxed) + 1;
+  g_ring_buffer.clear();
+  std::printf("streamd: flush/stop requested (gen=%llu)\n",
+              static_cast<unsigned long long>(new_gen));
+}
+
+std::string trim(const std::string& str) {
+  size_t first = str.find_first_not_of(" \t\r\n");
+  if (first == std::string::npos) return std::string();
+  size_t last = str.find_last_not_of(" \t\r\n");
+  return str.substr(first, last - first + 1);
+}
+
 void enqueue_utterance(std::string line) {
   {
     std::lock_guard<std::mutex> lock(g_utterance_queue_mutex);
     g_utterance_queue.push(std::move(line));
   }
   g_utterance_queue_cv.notify_one();
+}
+
+void process_input_line(const std::string& line) {
+  std::string trimmed = trim(line);
+  if (trimmed == "!stop" || trimmed == "!flush") {
+    handle_flush_command();
+  } else if (!trimmed.empty()) {
+    enqueue_utterance(line);
+  }
+}
+
+std::vector<std::string> split_sentences(const std::string& line) {
+  std::vector<std::string> sentences;
+  const size_t len = line.size();
+  size_t start = 0;
+
+  auto is_sentence_delim = [](char c) {
+    return c == '.' || c == '!' || c == '?' || c == ';';
+  };
+
+  for (size_t i = 0; i < len; ++i) {
+    if (is_sentence_delim(line[i])) {
+      if (line[i] == '.' && i > 0 && i + 1 < len &&
+          std::isdigit(static_cast<unsigned char>(line[i - 1])) &&
+          std::isdigit(static_cast<unsigned char>(line[i + 1]))) {
+        continue;
+      }
+
+      size_t delim_end = i;
+      while (delim_end + 1 < len && is_sentence_delim(line[delim_end + 1])) {
+        if (line[delim_end + 1] == '.' && delim_end + 2 < len &&
+            std::isdigit(static_cast<unsigned char>(line[delim_end])) &&
+            std::isdigit(static_cast<unsigned char>(line[delim_end + 2]))) {
+          break;
+        }
+        delim_end++;
+      }
+
+      if (delim_end + 1 == len || std::isspace(static_cast<unsigned char>(line[delim_end + 1]))) {
+        std::string s = trim(line.substr(start, delim_end + 1 - start));
+        if (!s.empty()) {
+          sentences.push_back(s);
+        }
+        start = delim_end + 1;
+        while (start < len && std::isspace(static_cast<unsigned char>(line[start]))) {
+          start++;
+        }
+        i = start - 1;
+      }
+    }
+  }
+
+  if (start < len) {
+    std::string s = trim(line.substr(start));
+    if (!s.empty()) {
+      sentences.push_back(s);
+    }
+  }
+
+  if (sentences.empty()) {
+    std::string s = trim(line);
+    if (!s.empty()) {
+      sentences.push_back(s);
+    }
+  }
+
+  return sentences;
 }
 
 // Thread B: owns tts/g2p exclusively, joined (not detached) by main() so
@@ -228,20 +347,44 @@ void run_synth_worker(moonshine_tts::MoonshineG2P& g2p, moonshine_tts::Moonshine
       g_utterance_queue.pop();
     }
 
+    // Snapshot the generation this utterance belongs to; a !stop/!flush that
+    // bumps g_generation after this point cancels it (checked per-sentence
+    // below), but nothing can have bumped it *before* this line was even
+    // dequeued from the front of the queue.
+    const uint64_t start_gen = g_generation.load(std::memory_order_relaxed);
+
     std::cout << line << '\n';
-    const std::string ipa = g2p.text_to_ipa(line);
-    std::cout << "  -> " << ipa << '\n';
-    broadcast_phoneme_line(ipa);
+    std::vector<std::string> sentences = split_sentences(line);
 
-    const std::vector<float> pcm = tts.synthesize_from_phonemes(ipa);
+    for (const auto& sentence : sentences) {
+      if (g_generation.load(std::memory_order_relaxed) != start_gen || g_shutting_down.load()) {
+        std::cout << "  [cancelled]\n";
+        break;
+      }
 
-    const size_t queued = push_all_blocking(pcm.data(), pcm.size());
-    std::cout << "  -> queued " << queued << " samples ("
-              << moonshine_tts::MoonshineTTS::kSampleRateHz << " Hz) for playback\n";
-    if (queued < pcm.size()) {
+      const std::string ipa = g2p.text_to_ipa(sentence);
+      std::cout << "  [sentence] " << sentence << "\n  -> " << ipa << '\n';
+      broadcast_phoneme_line(ipa);
 
-      std::cerr << "streamd: dropped " << (pcm.size() - queued)
-                << " samples of audio (shutting down)\n";
+      if (g_generation.load(std::memory_order_relaxed) != start_gen || g_shutting_down.load()) {
+        std::cout << "  [cancelled]\n";
+        break;
+      }
+
+      const std::vector<float> pcm = tts.synthesize_from_phonemes(ipa);
+
+      const size_t queued = push_all_blocking(pcm.data(), pcm.size(), start_gen);
+      if (g_generation.load(std::memory_order_relaxed) != start_gen) {
+        std::cout << "  [cancelled during playback push]\n";
+        break;
+      }
+
+      std::cout << "  -> queued " << queued << " samples ("
+                << moonshine_tts::MoonshineTTS::kSampleRateHz << " Hz) for playback\n";
+      if (queued < pcm.size() && !g_shutting_down.load()) {
+        std::cerr << "streamd: dropped " << (pcm.size() - queued)
+                  << " samples of audio\n";
+      }
     }
   }
 }
@@ -431,7 +574,7 @@ int main() {
       std::cerr << "streamd: accept() failed: " << std::strerror(errno) << '\n';
       break;
     }
-    read_lines(conn_fd, [](const std::string& line) { enqueue_utterance(line); });
+    read_lines(conn_fd, [](const std::string& line) { process_input_line(line); });
     close(conn_fd);
   }
 
