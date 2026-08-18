@@ -55,21 +55,28 @@ void handle_shutdown_signal(int) {
 }
 
 // Lock-free SPSC ring buffer: synth worker pushes, PipeWire's on_process
-// pops. Safe without a mutex because there's exactly one writer/reader pair.
+// pops. Safe without a mutex because there's exactly one writer/reader pair —
+// the producer owns write_, the consumer owns read_, and neither ever writes
+// the other's index. A flush (clear()) must therefore be *applied* by the
+// consumer, never by the producer: read_ having two writers is what would
+// break the invariant.
 class RingBuffer {
  public:
   explicit RingBuffer(size_t capacity_frames) : buf_(capacity_frames) {}
 
+  // Callable from any thread: only raises a flag. The consumer acts on it on
+  // its next pop(), i.e. within one PipeWire callback (sub-10ms) — fast
+  // enough for barge-in, and it keeps read_ single-writer.
   void clear() {
     clear_requested_.store(true, std::memory_order_release);
   }
 
-  // Never blocks; returns frames actually accepted (may be < count).
+  // Producer-only. Never blocks; returns frames actually accepted (may be
+  // < count). Deliberately does NOT consume clear_requested_ — doing so
+  // would make this thread write read_ concurrently with the consumer's own
+  // read_ store, letting a flush be silently undone (read_ moving backwards)
+  // and letting the unsigned `w - r` in pop() underflow into a huge avail.
   size_t push(const float* data, size_t count) {
-    if (clear_requested_.exchange(false, std::memory_order_acq_rel)) {
-      const size_t w = write_.load(std::memory_order_acquire);
-      read_.store(w, std::memory_order_release);
-    }
     const size_t w = write_.load(std::memory_order_relaxed);
     const size_t r = read_.load(std::memory_order_acquire);
     const size_t free_frames = buf_.size() - (w - r);
@@ -81,6 +88,7 @@ class RingBuffer {
     return n;
   }
 
+  // Consumer-only, and the sole place a pending clear() is applied.
   size_t pop(float* dst, size_t count) {
     if (clear_requested_.exchange(false, std::memory_order_acq_rel)) {
       const size_t w = write_.load(std::memory_order_acquire);
